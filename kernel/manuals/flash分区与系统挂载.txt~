@@ -1,0 +1,28 @@
+device nand0 <nandflash0>, # parts = 5
+ #: name		size		offset		mask_flags
+ 0: bios                0x00080000	0x00000000	0
+ 1: params              0x00008000	0x00080000	0
+ 2: logo                0x00078000	0x00088000	0
+ 3: kernel              0x00400000	0x00100000	0
+ 4: root                0x03b00000	0x00500000	0
+
+active partition: nand0,0 - (bios) 0x00080000 @ 0x00000000
+
+defaults:
+mtdids  : nand0=nandflash0
+mtdparts: mtdparts=nandflash0:512k@0(bios),32k(params),480k(logo),4m(kernel),-(root)
+
+
+
+setenv bootargs noinitrd root=/dev/nfs console=ttySAC0 init=/linuxrc nfsroot=192.168.1.8:/nfsboot/rootfs ip=192.168.1.6:192.168.1.8:192.168.1.1:255.255.255.0::eth0:on quiet
+setenv bootargs noinitrd root=/dev/nfs console=ttySAC0 init=/linuxrc nfsroot=192.168.1.8:/nfsboot/rootfs_v0.1 ip=192.168.1.6:192.168.1.8:192.168.1.1:255.255.255.0::eth0:on quiet 
+
+setenv bootargs noinitrd root=/dev/mtdblock4 init=/linuxrc console=ttySAC0 rootfstype=yaffs2
+setenv bootargs mem=64M console=ttySAC0,115200n8 noinitrd root=/dev/mtdblock4 rw init=/linuxrc rootfstype=yaffs2
+setenv bootargs mem=63M console=ttySAC0,115200n8 noinitrd root=/dev/mtdblock4 rw init=/linuxrc rootfstype=yaffs2
+
+setenv bootargs noinitrd root=/dev/nfs console=ttySAC0 init=/linuxrc nfsroot=192.168.1.8:/git/rootfs-for-YC2440/rootfs ip=192.168.1.6:192.168.1.8:192.168.1.1:255.255.255.0::eth0:on
+setenv bootargs noinitrd root=/dev/nfs console=ttySAC0 init=/linuxrc nfsroot=192.168.1.8:/git/rootfs-for-YC2440/root_qtopia ip=192.168.1.6:192.168.1.8:192.168.1.1:255.255.255.0::eth0:on
+
+
+

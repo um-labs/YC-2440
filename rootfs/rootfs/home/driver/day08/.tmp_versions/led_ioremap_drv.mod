@@ -1,0 +1,2 @@
+/git/rootfs-for-YC2440/rootfs/home/driver/day08/led_ioremap_drv.ko
+/git/rootfs-for-YC2440/rootfs/home/driver/day08/led_ioremap_drv.o

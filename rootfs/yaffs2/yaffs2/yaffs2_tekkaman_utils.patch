@@ -1,0 +1,728 @@
+diff -aruNp yaffs2/utils/Makefile yaffs2_tekkaman/utils/Makefile
+--- yaffs2/utils/Makefile	2007-03-07 16:30:40.000000000 +0800
++++ yaffs2_tekkaman/utils/Makefile	2010-04-27 22:44:52.156013752 +0800
+@@ -28,8 +28,9 @@ CC=$(MAKETOOLS)gcc
+ COMMONLINKS = yaffs_ecc.c
+ COMMONOBJS = $(COMMONLINKS:.c=.o)
+ 
+-MKYAFFSSOURCES = mkyaffsimage.c
+-MKYAFFSIMAGEOBJS = $(MKYAFFSSOURCES:.c=.o)
++MKYAFFSSOURCES = mkyaffsimage.c nand_ecc.c
++MKYAFFSLINKS   =  yaffs_packedtags1.c 
++MKYAFFSIMAGEOBJS = $(MKYAFFSSOURCES:.c=.o) $(MKYAFFSLINKS:.c=.o)
+ 
+ MKYAFFS2SOURCES = mkyaffs2image.c
+ MKYAFFS2LINKS = yaffs_packedtags2.c yaffs_tagsvalidity.c
+@@ -51,4 +52,4 @@ mkyaffs2image: $(COMMONOBJS) $(MKYAFFS2I
+ 
+ 
+ clean:
+-	rm -f $(COMMONOBJS) $(MKYAFFSIMAGEOBJS) $(MKYAFFS2IMAGEOBJS) $(COMMONLINKS) $(MKYAFFSLINKS) $(MKYAFFS2LINKS) mkyaffsimage mkyaffs2image core
++	rm -f $(COMMONOBJS) $(MKYAFFSIMAGEOBJS) $(MKYAFFS2IMAGEOBJS) $(COMMONLINKS) $(MKYAFFSLINKS) $(MKYAFFS2LINKS) mkyaffsimage mkyaffs2image core  *~
+diff -aruNp yaffs2/utils/mkyaffs2image.c yaffs2_tekkaman/utils/mkyaffs2image.c
+--- yaffs2/utils/mkyaffs2image.c	2010-01-12 05:43:18.000000000 +0800
++++ yaffs2_tekkaman/utils/mkyaffs2image.c	2010-04-28 00:53:00.000282575 +0800
+@@ -35,6 +35,19 @@
+ #include "yaffs_tagsvalidity.h"
+ #include "yaffs_packedtags2.h"
+ 
++void nand_calculate_ecc(const u_char *dat, u_char *ecc_code);
++
++typedef unsigned char		u_char;
++typedef unsigned short		u_short;
++typedef unsigned int		u_int;
++typedef unsigned long		u_long;
++
++typedef unsigned char		uint8_t;
++typedef unsigned short		uint16_t;
++typedef unsigned int		uint32_t;
++
++
++
+ unsigned yaffs_traceMask=0;
+ 
+ #define MAX_OBJECTS 10000
+@@ -42,7 +55,7 @@ unsigned yaffs_traceMask=0;
+ #define chunkSize 2048
+ #define spareSize 64
+ 
+-const char * mkyaffsimage_c_version = "$Id: mkyaffs2image.c,v 1.5 2010/01/11 21:43:18 charles Exp $";
++const char * mkyaffsimage_c_version = "$Id: mkyaffs2image.c,v 1.4 2007/02/14 01:09:06 wookey Exp $";
+ 
+ 
+ typedef struct
+@@ -65,6 +78,32 @@ static int error;
+ 
+ static int convert_endian = 0;
+ 
++struct nand_oobinfo {
++	uint32_t useecc;
++	uint32_t eccbytes;
++	uint32_t oobfree[8][2];
++	uint32_t eccpos[32];
++};
++
++/* ECC byte placement */
++#define MTD_NANDECC_OFF		0	// Switch off ECC (Not recommended)
++#define MTD_NANDECC_PLACE	1	// Use the given placement in the structure (YAFFS1 legacy mode)
++#define MTD_NANDECC_AUTOPLACE	2	// Use the default placement scheme
++#define MTD_NANDECC_PLACEONLY	3	// Use the given placement in the structure (Do not store ecc result on read)
++#define MTD_NANDECC_AUTOPL_USR 	4	// Use the given autoplacement scheme rather than using the default
++
++static struct nand_oobinfo nand_oob_64 = {
++	.useecc = MTD_NANDECC_AUTOPLACE,
++	.eccbytes = 24,
++	.eccpos = {
++		40, 41, 42, 43, 44, 45, 46, 47, 
++		48, 49, 50, 51, 52, 53, 54, 55, 
++		56, 57, 58, 59, 60, 61, 62, 63},
++	.oobfree = { {2, 38} }
++};
++
++static u_char oob_buf[spareSize];
++
+ static int obj_compare(const void *a, const void * b)
+ {
+   objItem *oa, *ob;
+@@ -125,9 +164,10 @@ static int find_obj_in_list(dev_t dev, i
+  * NOTE: The tag is not usable after this other than calculating the CRC
+  * with.
+  */
++#if 0 // FIXME NCB
+ static void little_to_big_endian(yaffs_Tags *tagsPtr)
+ {
+-#if 0 // FIXME NCB
++
+     yaffs_TagsUnion * tags = (yaffs_TagsUnion* )tagsPtr; // Work in bytes.
+     yaffs_TagsUnion   temp;
+ 
+@@ -151,13 +191,159 @@ static void little_to_big_endian(yaffs_T
+     tags->asBytes[5] = temp.asBytes[5];
+     tags->asBytes[6] = temp.asBytes[6];
+     tags->asBytes[7] = temp.asBytes[7];
++
++}
+ #endif
++
++/*
++ * Pre-calculated 256-way 1 byte column parity
++ */
++static const u_char nand_ecc_precalc_table[] = {
++	0x00, 0x55, 0x56, 0x03, 0x59, 0x0c, 0x0f, 0x5a, 0x5a, 0x0f, 0x0c, 0x59, 0x03, 0x56, 0x55, 0x00,
++	0x65, 0x30, 0x33, 0x66, 0x3c, 0x69, 0x6a, 0x3f, 0x3f, 0x6a, 0x69, 0x3c, 0x66, 0x33, 0x30, 0x65,
++	0x66, 0x33, 0x30, 0x65, 0x3f, 0x6a, 0x69, 0x3c, 0x3c, 0x69, 0x6a, 0x3f, 0x65, 0x30, 0x33, 0x66,
++	0x03, 0x56, 0x55, 0x00, 0x5a, 0x0f, 0x0c, 0x59, 0x59, 0x0c, 0x0f, 0x5a, 0x00, 0x55, 0x56, 0x03,
++	0x69, 0x3c, 0x3f, 0x6a, 0x30, 0x65, 0x66, 0x33, 0x33, 0x66, 0x65, 0x30, 0x6a, 0x3f, 0x3c, 0x69,
++	0x0c, 0x59, 0x5a, 0x0f, 0x55, 0x00, 0x03, 0x56, 0x56, 0x03, 0x00, 0x55, 0x0f, 0x5a, 0x59, 0x0c,
++	0x0f, 0x5a, 0x59, 0x0c, 0x56, 0x03, 0x00, 0x55, 0x55, 0x00, 0x03, 0x56, 0x0c, 0x59, 0x5a, 0x0f,
++	0x6a, 0x3f, 0x3c, 0x69, 0x33, 0x66, 0x65, 0x30, 0x30, 0x65, 0x66, 0x33, 0x69, 0x3c, 0x3f, 0x6a,
++	0x6a, 0x3f, 0x3c, 0x69, 0x33, 0x66, 0x65, 0x30, 0x30, 0x65, 0x66, 0x33, 0x69, 0x3c, 0x3f, 0x6a,
++	0x0f, 0x5a, 0x59, 0x0c, 0x56, 0x03, 0x00, 0x55, 0x55, 0x00, 0x03, 0x56, 0x0c, 0x59, 0x5a, 0x0f,
++	0x0c, 0x59, 0x5a, 0x0f, 0x55, 0x00, 0x03, 0x56, 0x56, 0x03, 0x00, 0x55, 0x0f, 0x5a, 0x59, 0x0c,
++	0x69, 0x3c, 0x3f, 0x6a, 0x30, 0x65, 0x66, 0x33, 0x33, 0x66, 0x65, 0x30, 0x6a, 0x3f, 0x3c, 0x69,
++	0x03, 0x56, 0x55, 0x00, 0x5a, 0x0f, 0x0c, 0x59, 0x59, 0x0c, 0x0f, 0x5a, 0x00, 0x55, 0x56, 0x03,
++	0x66, 0x33, 0x30, 0x65, 0x3f, 0x6a, 0x69, 0x3c, 0x3c, 0x69, 0x6a, 0x3f, 0x65, 0x30, 0x33, 0x66,
++	0x65, 0x30, 0x33, 0x66, 0x3c, 0x69, 0x6a, 0x3f, 0x3f, 0x6a, 0x69, 0x3c, 0x66, 0x33, 0x30, 0x65,
++	0x00, 0x55, 0x56, 0x03, 0x59, 0x0c, 0x0f, 0x5a, 0x5a, 0x0f, 0x0c, 0x59, 0x03, 0x56, 0x55, 0x00
++};
++
++
++/**
++ * nand_trans_result - [GENERIC] create non-inverted ECC
++ * @reg2:	line parity reg 2
++ * @reg3:	line parity reg 3
++ * @ecc_code:	ecc 
++ *
++ * Creates non-inverted ECC code from line parity
++ */
++static void nand_trans_result(u_char reg2, u_char reg3,
++	u_char *ecc_code)
++{
++	u_char a, b, i, tmp1, tmp2;
++	
++	/* Initialize variables */
++	a = b = 0x80;
++	tmp1 = tmp2 = 0;
++	
++	/* Calculate first ECC byte */
++	for (i = 0; i < 4; i++) {
++		if (reg3 & a)		/* LP15,13,11,9 --> ecc_code[0] */
++			tmp1 |= b;
++		b >>= 1;
++		if (reg2 & a)		/* LP14,12,10,8 --> ecc_code[0] */
++			tmp1 |= b;
++		b >>= 1;
++		a >>= 1;
++	}
++	
++	/* Calculate second ECC byte */
++	b = 0x80;
++	for (i = 0; i < 4; i++) {
++		if (reg3 & a)		/* LP7,5,3,1 --> ecc_code[1] */
++			tmp2 |= b;
++		b >>= 1;
++		if (reg2 & a)		/* LP6,4,2,0 --> ecc_code[1] */
++			tmp2 |= b;
++		b >>= 1;
++		a >>= 1;
++	}
++	
++	/* Store two of the ECC bytes */
++	ecc_code[0] = tmp1;
++	ecc_code[1] = tmp2;
+ }
+ 
++/**
++ * nand_calculate_ecc - [NAND Interface] Calculate 3 byte ECC code for 256 byte block
++ * @mtd:	MTD block structure
++ * @dat:	raw data
++ * @ecc_code:	buffer for ECC
++ */
++void nand_calculate_ecc(const u_char *dat, u_char *ecc_code)
++{
++	u_char idx, reg1, reg2, reg3;
++	int j;
++	
++	/* Initialize variables */
++	reg1 = reg2 = reg3 = 0;
++	ecc_code[0] = ecc_code[1] = ecc_code[2] = 0;
++	
++	/* Build up column parity */ 
++	for(j = 0; j < 256; j++) {
++		
++		/* Get CP0 - CP5 from table */
++		idx = nand_ecc_precalc_table[dat[j]];
++		reg1 ^= (idx & 0x3f);
++		
++		/* All bit XOR = 1 ? */
++		if (idx & 0x40) {
++			reg3 ^= (u_char) j;
++			reg2 ^= ~((u_char) j);
++		}
++	}
++	
++	/* Create non-inverted ECC code from line parity */
++	nand_trans_result(reg2, reg3, ecc_code);
++	
++	/* Calculate final ECC code */
++	ecc_code[0] = ~ecc_code[0];
++	ecc_code[1] = ~ecc_code[1];
++	ecc_code[2] = ((~reg1) << 2) | 0x03;
++//	return 0;
++}
++
++
++/** 
++ * nand_prepare_oobbuf - [GENERIC] Prepare the out of band buffer 
++ * @fsbuf:	buffer given by fs driver
++ * @oobsel:	out of band selection structre
++ * @autoplace:	1 = place given buffer into the oob bytes
++ * @numpages:	number of pages to prepare
++ *
++ * Return:
++ * 1. Filesystem buffer available and autoplacement is off,
++ *    return filesystem buffer
++ * 2. No filesystem buffer or autoplace is off, return internal
++ *    buffer
++ * 3. Filesystem buffer is given and autoplace selected
++ *    put data from fs buffer into internal buffer and
++ *    retrun internal buffer
++ *
++ * Note: The internal buffer is filled with 0xff. This must
++ * be done only once, when no autoplacement happens
++ * Autoplacement sets the buffer dirty flag, which
++ * forces the 0xff fill before using the buffer again.
++ *
++*/
++static void nand_prepare_oobbuf (u_char *oob_buf_local, u_char *fs_buf, struct nand_oobinfo *oobsel)
++{
++	int i;
++
++	for (i = 0; oobsel->oobfree[i][1]; i++) {
++		int to = oobsel->oobfree[i][0];
++		int num = oobsel->oobfree[i][1];
++		memcpy (&oob_buf_local[to], fs_buf, num);
++		fs_buf += num;
++	}	
++}
++
++
+ static int write_chunk(__u8 *data, __u32 objId, __u32 chunkId, __u32 nBytes)
+ {
+ 	yaffs_ExtendedTags t;
+ 	yaffs_PackedTags2 pt;
++	__u8 ecc_code[3];
++	int i;
+ 
+ 	error = write(outFile,data,chunkSize);
+ 	if(error < 0) return error;
+@@ -177,15 +363,27 @@ static int write_chunk(__u8 *data, __u32
+ 
+ 	if (convert_endian)
+ 	{
+-    	    little_to_big_endian(&t);
++//FIXME
++//    	    little_to_big_endian(&t);
+ 	}
+ 
+ 	nPages++;
+ 
+-	yaffs_PackTags2(&pt,&t,1);
++	yaffs_PackTags2(&pt, &t, 1);
+ 	
+ //	return write(outFile,&pt,sizeof(yaffs_PackedTags2));
+-	return write(outFile,&pt,spareSize);
++
++	memset(oob_buf, 0xff, sizeof(oob_buf));
++	nand_prepare_oobbuf(oob_buf, (u_char *)&pt, &nand_oob_64);
++
++	for (i = 0; i < chunkSize/256; i++) {
++	    nand_calculate_ecc(data+i*256, ecc_code);
++		oob_buf[nand_oob_64.eccpos[i*3]] = ecc_code[0];
++		oob_buf[nand_oob_64.eccpos[i*3]+1] = ecc_code[1];
++		oob_buf[nand_oob_64.eccpos[i*3]+2] = ecc_code[2];
++	}
++	
++	return write(outFile,oob_buf,spareSize);
+ 	
+ }
+ 
+@@ -233,13 +431,15 @@ static void object_header_little_to_big_
+     oh->win_atime[1] = SWAP32(oh->win_atime[1]);
+     oh->win_mtime[0] = SWAP32(oh->win_mtime[0]);
+     oh->win_mtime[1] = SWAP32(oh->win_mtime[1]);
++#else
+     oh->roomToGrow[0] = SWAP32(oh->roomToGrow[0]);
+     oh->roomToGrow[1] = SWAP32(oh->roomToGrow[1]);
+     oh->roomToGrow[2] = SWAP32(oh->roomToGrow[2]);
+     oh->roomToGrow[3] = SWAP32(oh->roomToGrow[3]);
+     oh->roomToGrow[4] = SWAP32(oh->roomToGrow[4]);
+     oh->roomToGrow[5] = SWAP32(oh->roomToGrow[5]);
+-#else
++#if 0
++//#else
+     oh->roomToGrow[0] = SWAP32(oh->roomToGrow[0]);
+     oh->roomToGrow[1] = SWAP32(oh->roomToGrow[1]);
+     oh->roomToGrow[2] = SWAP32(oh->roomToGrow[2]);
+@@ -253,6 +453,7 @@ static void object_header_little_to_big_
+     oh->roomToGrow[10] = SWAP32(oh->roomToGrow[10]);
+     oh->roomToGrow[11] = SWAP32(oh->roomToGrow[11]);
+ #endif
++#endif
+ }
+ 
+ static int write_object_header(int objId, yaffs_ObjectType t, struct stat *s, int parent, const char *name, int equivalentObj, const char * alias)
+@@ -369,9 +570,11 @@ static int process_directory(int parent,
+ 						
+ 							memset(symname,0, sizeof(symname));
+ 					
+-							readlink(full_name,symname,sizeof(symname) -1);
+-						
++							if (readlink(full_name,symname,sizeof(symname) -1) == -1) {
++								printf("symlink to \"%s\" error!!\n",symname);
++								} else {								
+ 							printf("symlink to \"%s\"\n",symname);
++								}
+ 							error =  write_object_header(newObj, YAFFS_OBJECT_TYPE_SYMLINK, &stats, parent, entry->d_name, -1, symname);
+ 
+ 						}
+diff -aruNp yaffs2/utils/mkyaffsimage.c yaffs2_tekkaman/utils/mkyaffsimage.c
+--- yaffs2/utils/mkyaffsimage.c	2009-01-26 02:21:17.000000000 +0800
++++ yaffs2_tekkaman/utils/mkyaffsimage.c	2010-04-28 00:53:10.304962022 +0800
+@@ -29,10 +29,12 @@
+ #include <unistd.h>
+ #include "yaffs_ecc.h"
+ #include "yaffs_guts.h"
+-
++#include "yaffs_packedtags1.h"
+ 
+ #define MAX_OBJECTS 10000
+ 
++extern void nand_calculate_ecc(const u_char *dat, u_char *ecc_code);
++
+ const char * mkyaffsimage_c_version = "$Id: mkyaffsimage.c,v 1.7 2003/07/16 03:00:48 charles Exp $";
+ 
+ 
+@@ -112,30 +114,6 @@ static int find_obj_in_list(dev_t dev, i
+ 	return -1;
+ }
+ 
+-// NCB added 10/9/2002
+-static __u16 yaffs_CalcNameSum(const char *name)
+-{
+-	__u16 sum = 0;
+-	__u16 i = 1;
+-	
+-	__u8 *bname = (__u8 *)name;
+-	
+-	while (*bname)
+-	{
+-		sum += (*bname) * i;
+-		i++;
+-		bname++;
+-	}
+-	return sum;
+-}
+-
+-
+-static void yaffs_CalcECC(const __u8 *data, yaffs_Spare *spare)
+-{
+-	yaffs_ECCCalculate(data , spare->ecc1);
+-	yaffs_ECCCalculate(&data[256] , spare->ecc2);
+-}
+-
+ static void yaffs_CalcTagsECC(yaffs_Tags *tags)
+ {
+ 	// Todo don't do anything yet. Need to calculate ecc
+@@ -181,6 +159,33 @@ static void yaffs_CalcTagsECC(yaffs_Tags
+         b[7] |= ((ecc & 0x3F) << 2);
+     }
+ }
++
++#if 0
++// NCB added 10/9/2002
++static __u16 yaffs_CalcNameSum(const char *name)
++{
++	__u16 sum = 0;
++	__u16 i = 1;
++	
++	__u8 *bname = (__u8 *)name;
++	
++	while (*bname)
++	{
++		sum += (*bname) * i;
++		i++;
++		bname++;
++	}
++	return sum;
++}
++
++
++static void yaffs_CalcECC(const __u8 *data, yaffs_Spare *spare)
++{
++	yaffs_ECCCalculate(data , spare->ecc1);
++	yaffs_ECCCalculate(&data[256] , spare->ecc2);
++}
++
++
+ static void yaffs_LoadTagsIntoSpare(yaffs_Spare *sparePtr, yaffs_Tags *tagsPtr)
+ {
+ 	yaffs_TagsUnion *tu = (yaffs_TagsUnion *)tagsPtr;
+@@ -227,9 +232,11 @@ static void little_to_big_endian(yaffs_T
+     tags->asBytes[6] = temp.asBytes[6];
+     tags->asBytes[7] = temp.asBytes[7];
+ }
++#endif
+ 
+ static int write_chunk(__u8 *data, __u32 objId, __u32 chunkId, __u32 nBytes)
+ {
++#ifdef CONFIG_YAFFS_9BYTE_TAGS
+ 	yaffs_Tags t;
+ 	yaffs_Spare s;
+ 
+@@ -241,7 +248,7 @@ static int write_chunk(__u8 *data, __u32
+ 	
+ 	t.chunkId = chunkId;
+ 	t.serialNumber = 0;
+-	t.byteCountLSB = nBytes;
++	t.byteCount = nBytes;
+ 	t.objectId = objId;
+ 
+     if (convert_endian)
+@@ -256,7 +263,53 @@ static int write_chunk(__u8 *data, __u32
+ 	nPages++;
+ 	
+ 	return write(outFile,&s,sizeof(yaffs_Spare));
+-	
++#else	/* modified by thisway.diy@163.com, from www.100ask.net, to support the new oob layout of kernel 2.6.22 */
++	yaffs_PackedTags1 pt1;
++	yaffs_ExtendedTags  etags;
++	__u8 ecc_code[6];
++	__u8 oobbuf[16];
++    
++    /* 写页数据，512字节 */
++    error = write(outFile,data,512);
++    if(error < 0) return error;
++
++    /* 构造tag */
++    etags.chunkId       = chunkId;
++    etags.serialNumber  = 0;
++    etags.byteCount     = nBytes;
++    etags.objectId      = objId;
++    etags.chunkDeleted  = 0;
++
++    /* 
++     * 重定位oob区中的可用数据(称为tag)
++     */
++    yaffs_PackTags1(&pt1, &etags);
++
++    /* 计算tag本身的ECC码 */
++    yaffs_CalcTagsECC((yaffs_Tags *)&pt1);
++
++    memset(oobbuf, 0xff, 16);
++    memcpy(oobbuf+8, &pt1, 8);
++
++    /* 
++     * 使用与内核MTD层相同的方法计算一页数据(512字节)的ECC码 
++     * 并把它们填入oob
++     */
++    nand_calculate_ecc((u_char *)data, (u_char *) &ecc_code[0]);
++    nand_calculate_ecc((u_char *)data+256, (u_char *) &ecc_code[3]);
++
++    oobbuf[0] = ecc_code[0];
++    oobbuf[1] = ecc_code[1];
++    oobbuf[2] = ecc_code[2];
++    oobbuf[3] = ecc_code[3];
++    oobbuf[6] = ecc_code[4];
++    oobbuf[7] = ecc_code[5];
++
++    nPages++;
++
++    /* 写oob数据，16字节 */
++    return write(outFile, oobbuf, 16);
++#endif	
+ }
+ 
+ #define SWAP32(x)   ((((x) & 0x000000FF) << 24) | \
+@@ -303,13 +356,15 @@ static void object_header_little_to_big_
+     oh->win_atime[1] = SWAP32(oh->win_atime[1]);
+     oh->win_mtime[0] = SWAP32(oh->win_mtime[0]);
+     oh->win_mtime[1] = SWAP32(oh->win_mtime[1]);
++#else
+     oh->roomToGrow[0] = SWAP32(oh->roomToGrow[0]);
+     oh->roomToGrow[1] = SWAP32(oh->roomToGrow[1]);
+     oh->roomToGrow[2] = SWAP32(oh->roomToGrow[2]);
+     oh->roomToGrow[3] = SWAP32(oh->roomToGrow[3]);
+     oh->roomToGrow[4] = SWAP32(oh->roomToGrow[4]);
+     oh->roomToGrow[5] = SWAP32(oh->roomToGrow[5]);
+-#else
++#if 0
++//#else
+     oh->roomToGrow[0] = SWAP32(oh->roomToGrow[0]);
+     oh->roomToGrow[1] = SWAP32(oh->roomToGrow[1]);
+     oh->roomToGrow[2] = SWAP32(oh->roomToGrow[2]);
+@@ -323,6 +378,7 @@ static void object_header_little_to_big_
+     oh->roomToGrow[10] = SWAP32(oh->roomToGrow[10]);
+     oh->roomToGrow[11] = SWAP32(oh->roomToGrow[11]);
+ #endif
++#endif
+ }
+ 
+ static int write_object_header(int objId, yaffs_ObjectType t, struct stat *s, int parent, const char *name, int equivalentObj, const char * alias)
+@@ -439,9 +495,11 @@ static int process_directory(int parent,
+ 						
+ 							memset(symname,0, sizeof(symname));
+ 					
+-							readlink(full_name,symname,sizeof(symname) -1);
+-						
++							if (readlink(full_name,symname,sizeof(symname) -1) == -1) {
++								printf("symlink to \"%s\" error!!\n",symname);
++								} else {								
+ 							printf("symlink to \"%s\"\n",symname);
++								}
+ 							error =  write_object_header(newObj, YAFFS_OBJECT_TYPE_SYMLINK, &stats, parent, entry->d_name, -1, symname);
+ 
+ 						}
+diff -aruNp yaffs2/utils/nand_ecc.c yaffs2_tekkaman/utils/nand_ecc.c
+--- yaffs2/utils/nand_ecc.c	1970-01-01 08:00:00.000000000 +0800
++++ yaffs2_tekkaman/utils/nand_ecc.c	2010-04-27 23:45:05.275962106 +0800
+@@ -0,0 +1,199 @@
++/*
++ * This file contains an ECC algorithm from Toshiba that detects and
++ * corrects 1 bit errors in a 256 byte block of data.
++ *
++ * drivers/mtd/nand/nand_ecc.c
++ *
++ * Copyright (C) 2000-2004 Steven J. Hill (sjhill@realitydiluted.com)
++ *                         Toshiba America Electronics Components, Inc.
++ *
++ * Copyright (C) 2006 Thomas Gleixner <tglx@linutronix.de>
++ *
++ * $Id: nand_ecc.c,v 1.15 2005/11/07 11:14:30 gleixner Exp $
++ *
++ * This file is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the
++ * Free Software Foundation; either version 2 or (at your option) any
++ * later version.
++ *
++ * This file is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++ * for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this file; if not, write to the Free Software Foundation, Inc.,
++ * 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA.
++ *
++ * As a special exception, if other files instantiate templates or use
++ * macros or inline functions from these files, or you compile these
++ * files and link them with other works to produce a work based on these
++ * files, these files do not by themselves cause the resulting work to be
++ * covered by the GNU General Public License. However the source code for
++ * these files must still be made available in accordance with section (3)
++ * of the GNU General Public License.
++ *
++ * This exception does not invalidate any other reasons why a work based on
++ * this file might be covered by the GNU General Public License.
++ */
++
++#include <linux/types.h>
++
++typedef unsigned char		u_char;
++typedef unsigned short		u_short;
++typedef unsigned int		u_int;
++typedef unsigned long		u_long;
++
++typedef unsigned char		uint8_t;
++typedef unsigned short		uint16_t;
++typedef unsigned int		uint32_t;
++
++
++/*
++ * Pre-calculated 256-way 1 byte column parity
++ */
++static const u_char nand_ecc_precalc_table[] = {
++	0x00, 0x55, 0x56, 0x03, 0x59, 0x0c, 0x0f, 0x5a, 0x5a, 0x0f, 0x0c, 0x59, 0x03, 0x56, 0x55, 0x00,
++	0x65, 0x30, 0x33, 0x66, 0x3c, 0x69, 0x6a, 0x3f, 0x3f, 0x6a, 0x69, 0x3c, 0x66, 0x33, 0x30, 0x65,
++	0x66, 0x33, 0x30, 0x65, 0x3f, 0x6a, 0x69, 0x3c, 0x3c, 0x69, 0x6a, 0x3f, 0x65, 0x30, 0x33, 0x66,
++	0x03, 0x56, 0x55, 0x00, 0x5a, 0x0f, 0x0c, 0x59, 0x59, 0x0c, 0x0f, 0x5a, 0x00, 0x55, 0x56, 0x03,
++	0x69, 0x3c, 0x3f, 0x6a, 0x30, 0x65, 0x66, 0x33, 0x33, 0x66, 0x65, 0x30, 0x6a, 0x3f, 0x3c, 0x69,
++	0x0c, 0x59, 0x5a, 0x0f, 0x55, 0x00, 0x03, 0x56, 0x56, 0x03, 0x00, 0x55, 0x0f, 0x5a, 0x59, 0x0c,
++	0x0f, 0x5a, 0x59, 0x0c, 0x56, 0x03, 0x00, 0x55, 0x55, 0x00, 0x03, 0x56, 0x0c, 0x59, 0x5a, 0x0f,
++	0x6a, 0x3f, 0x3c, 0x69, 0x33, 0x66, 0x65, 0x30, 0x30, 0x65, 0x66, 0x33, 0x69, 0x3c, 0x3f, 0x6a,
++	0x6a, 0x3f, 0x3c, 0x69, 0x33, 0x66, 0x65, 0x30, 0x30, 0x65, 0x66, 0x33, 0x69, 0x3c, 0x3f, 0x6a,
++	0x0f, 0x5a, 0x59, 0x0c, 0x56, 0x03, 0x00, 0x55, 0x55, 0x00, 0x03, 0x56, 0x0c, 0x59, 0x5a, 0x0f,
++	0x0c, 0x59, 0x5a, 0x0f, 0x55, 0x00, 0x03, 0x56, 0x56, 0x03, 0x00, 0x55, 0x0f, 0x5a, 0x59, 0x0c,
++	0x69, 0x3c, 0x3f, 0x6a, 0x30, 0x65, 0x66, 0x33, 0x33, 0x66, 0x65, 0x30, 0x6a, 0x3f, 0x3c, 0x69,
++	0x03, 0x56, 0x55, 0x00, 0x5a, 0x0f, 0x0c, 0x59, 0x59, 0x0c, 0x0f, 0x5a, 0x00, 0x55, 0x56, 0x03,
++	0x66, 0x33, 0x30, 0x65, 0x3f, 0x6a, 0x69, 0x3c, 0x3c, 0x69, 0x6a, 0x3f, 0x65, 0x30, 0x33, 0x66,
++	0x65, 0x30, 0x33, 0x66, 0x3c, 0x69, 0x6a, 0x3f, 0x3f, 0x6a, 0x69, 0x3c, 0x66, 0x33, 0x30, 0x65,
++	0x00, 0x55, 0x56, 0x03, 0x59, 0x0c, 0x0f, 0x5a, 0x5a, 0x0f, 0x0c, 0x59, 0x03, 0x56, 0x55, 0x00
++};
++
++/**
++ * nand_calculate_ecc - [NAND Interface] Calculate 3-byte ECC for 256-byte block
++ * @mtd:	MTD block structure
++ * @dat:	raw data
++ * @ecc_code:	buffer for ECC
++ */
++void nand_calculate_ecc(const u_char *dat, u_char *ecc_code)
++{
++	uint8_t idx, reg1, reg2, reg3, tmp1, tmp2;
++	int i;
++
++	/* Initialize variables */
++	reg1 = reg2 = reg3 = 0;
++
++	/* Build up column parity */
++	for(i = 0; i < 256; i++) {
++		/* Get CP0 - CP5 from table */
++		idx = nand_ecc_precalc_table[*dat++];
++		reg1 ^= (idx & 0x3f);
++
++		/* All bit XOR = 1 ? */
++		if (idx & 0x40) {
++			reg3 ^= (uint8_t) i;
++			reg2 ^= ~((uint8_t) i);
++		}
++	}
++
++	/* Create non-inverted ECC code from line parity */
++	tmp1  = (reg3 & 0x80) >> 0; /* B7 -> B7 */
++	tmp1 |= (reg2 & 0x80) >> 1; /* B7 -> B6 */
++	tmp1 |= (reg3 & 0x40) >> 1; /* B6 -> B5 */
++	tmp1 |= (reg2 & 0x40) >> 2; /* B6 -> B4 */
++	tmp1 |= (reg3 & 0x20) >> 2; /* B5 -> B3 */
++	tmp1 |= (reg2 & 0x20) >> 3; /* B5 -> B2 */
++	tmp1 |= (reg3 & 0x10) >> 3; /* B4 -> B1 */
++	tmp1 |= (reg2 & 0x10) >> 4; /* B4 -> B0 */
++
++	tmp2  = (reg3 & 0x08) << 4; /* B3 -> B7 */
++	tmp2 |= (reg2 & 0x08) << 3; /* B3 -> B6 */
++	tmp2 |= (reg3 & 0x04) << 3; /* B2 -> B5 */
++	tmp2 |= (reg2 & 0x04) << 2; /* B2 -> B4 */
++	tmp2 |= (reg3 & 0x02) << 2; /* B1 -> B3 */
++	tmp2 |= (reg2 & 0x02) << 1; /* B1 -> B2 */
++	tmp2 |= (reg3 & 0x01) << 1; /* B0 -> B1 */
++	tmp2 |= (reg2 & 0x01) << 0; /* B7 -> B0 */
++
++	/* Calculate final ECC code */
++#ifdef CONFIG_MTD_NAND_ECC_SMC
++	ecc_code[0] = ~tmp2;
++	ecc_code[1] = ~tmp1;
++#else
++	ecc_code[0] = ~tmp1;
++	ecc_code[1] = ~tmp2;
++#endif
++	ecc_code[2] = ((~reg1) << 2) | 0x03;
++
++//	return 0;
++}
++//EXPORT_SYMBOL(nand_calculate_ecc);
++
++static inline int countbits(uint32_t byte)
++{
++	int res = 0;
++
++	for (;byte; byte >>= 1)
++		res += byte & 0x01;
++	return res;
++}
++
++/**
++ * nand_correct_data - [NAND Interface] Detect and correct bit error(s)
++ * @mtd:	MTD block structure
++ * @dat:	raw data read from the chip
++ * @read_ecc:	ECC from the chip
++ * @calc_ecc:	the ECC calculated from raw data
++ *
++ * Detect and correct a 1 bit error for 256 byte block
++ */
++int nand_correct_data(u_char *dat, u_char *read_ecc, u_char *calc_ecc)
++{
++	uint8_t s0, s1, s2;
++
++#ifdef CONFIG_MTD_NAND_ECC_SMC
++	s0 = calc_ecc[0] ^ read_ecc[0];
++	s1 = calc_ecc[1] ^ read_ecc[1];
++	s2 = calc_ecc[2] ^ read_ecc[2];
++#else
++	s1 = calc_ecc[0] ^ read_ecc[0];
++	s0 = calc_ecc[1] ^ read_ecc[1];
++	s2 = calc_ecc[2] ^ read_ecc[2];
++#endif
++	if ((s0 | s1 | s2) == 0)
++		return 0;
++
++	/* Check for a single bit error */
++	if( ((s0 ^ (s0 >> 1)) & 0x55) == 0x55 &&
++	    ((s1 ^ (s1 >> 1)) & 0x55) == 0x55 &&
++	    ((s2 ^ (s2 >> 1)) & 0x54) == 0x54) {
++
++		uint32_t byteoffs, bitnum;
++
++		byteoffs = (s1 << 0) & 0x80;
++		byteoffs |= (s1 << 1) & 0x40;
++		byteoffs |= (s1 << 2) & 0x20;
++		byteoffs |= (s1 << 3) & 0x10;
++
++		byteoffs |= (s0 >> 4) & 0x08;
++		byteoffs |= (s0 >> 3) & 0x04;
++		byteoffs |= (s0 >> 2) & 0x02;
++		byteoffs |= (s0 >> 1) & 0x01;
++
++		bitnum = (s2 >> 5) & 0x04;
++		bitnum |= (s2 >> 4) & 0x02;
++		bitnum |= (s2 >> 3) & 0x01;
++
++		dat[byteoffs] ^= (1 << bitnum);
++
++		return 1;
++	}
++
++	if(countbits(s0 | ((uint32_t)s1 << 8) | ((uint32_t)s2 <<16)) == 1)
++		return 1;
++
++	return -1;
++}
++

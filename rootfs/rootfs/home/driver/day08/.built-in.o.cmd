@@ -1,0 +1,1 @@
+cmd_/git/rootfs-for-YC2440/rootfs/home/driver/day08/built-in.o :=  rm -f /git/rootfs-for-YC2440/rootfs/home/driver/day08/built-in.o; arm-linux-ar rcs /git/rootfs-for-YC2440/rootfs/home/driver/day08/built-in.o

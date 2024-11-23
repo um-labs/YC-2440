@@ -1,0 +1,16 @@
+#!/bin/sh
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+runlevel=S
+prevlevel=N
+umask 022
+export PATH runlevel prevlevel
+echo "---------------- mount all --------------------"
+mount -a
+echo /sbin/mdev>/proc/sys/kernel/hotplug
+mdev -s
+echo "***********************************************"
+echo "************** SMDK2440 BOARD *****************"
+echo "Linux kernel version:linux-2.6.35.7"
+echo "***********************************************"
+/bin/hostname -F /etc/sysconfig/HOSTNAME
+
